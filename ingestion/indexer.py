@@ -1,22 +1,15 @@
 """
 ingestion/indexer.py
 ====================
-Persiste e consulta chunks de editais no ChromaDB.
+Persiste e consulta chunks de editais no ChromaDB com suporte a metadados estendidos.
 
 Usa duas colecoes separadas para implementar o Parent-Child retrieval:
-
   editais_children  - chunks pequenos (~175 tokens), indexados por embedding.
                       Usados na busca semantica. Cada child conhece seu parent_id.
 
   editais_parents   - chunks grandes (~700 tokens), armazenados sem embedding.
                       Recuperados por ID apos a busca nos children.
                       Sao eles que vao para o contexto do LLM.
-
-Essa separacao garante que a busca semantica opera em textos curtos e precisos,
-enquanto o LLM recebe o contexto completo da clausula para gerar a resposta.
-
-Dependencias:
-    pip install chromadb
 """
 
 from __future__ import annotations
@@ -24,7 +17,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import numpy as np
 import requests
@@ -38,18 +31,7 @@ from ingestion.chunker import Chunk, ChunkResult
 # Embedding functions
 
 class OllamaEmbedder(EmbeddingFunction):
-    """
-    Gera embeddings via Ollama rodando localmente.
-
-    Requer Ollama instalado e o modelo baixado:
-        ollama pull nomic-embed-text
-
-    O modelo nomic-embed-text e multilingual e funciona bem com portugues,
-    ao contrario do all-MiniLM-L6-v2 que e treinado principalmente em ingles.
-
-    Uso:
-        indexer = EditalIndexer(embedding_fn=OllamaEmbedder())
-    """
+    """Gera embeddings via Ollama rodando localmente com o modelo nomic-embed-text."""
 
     def __init__(self, model_name: str = "nomic-embed-text"):
         self.model_name = model_name
@@ -73,10 +55,7 @@ class OllamaEmbedder(EmbeddingFunction):
 
 
 class HashEmbedder(EmbeddingFunction):
-    """
-    Embedding deterministico baseado em hash — apenas para testes unitarios.
-    Nao captura semantica real. Nao usar em producao.
-    """
+    """Embedding deterministico baseado em hash — apenas para testes unitarios."""
 
     def __init__(self, dims: int = 384):
         self.dims = dims
@@ -134,7 +113,7 @@ class IndexSummary:
 
 @dataclass
 class SearchResult:
-    """Resultado de busca semantica com child e parent expandido."""
+    """Resultado de busca semantica enriquecido com parent e referencias cruzadas."""
     child_id: str
     child_text: str
     child_score: float      # distancia coseno (menor = mais similar)
@@ -150,22 +129,13 @@ class SearchResult:
     contains_value: bool
     source_file: str
     edital_id: str
+    referenced_clauses: list[str] = field(default_factory=list) # Ativado para Multi-Hop
+
 
 # Indexador principal
 
 class EditalIndexer:
-    """
-    Gerencia a indexacao e busca de editais no ChromaDB.
-
-    Inicializa duas colecoes no banco (criando-as se nao existirem) e
-    expoe metodos para indexar ChunkResults, buscar por similaridade
-    semantica com filtros de metadados, e remover editais do indice.
-
-    Parâmetros:
-        persist_dir  : diretorio onde o ChromaDB salva os dados em disco.
-        embedding_fn : funcao de embedding. Use OllamaEmbedder() em producao
-                       e HashEmbedder() em testes unitarios.
-    """
+    """Gerencia a indexacao e busca estruturada de editais no ChromaDB."""
 
     def __init__(
         self,
@@ -187,15 +157,7 @@ class EditalIndexer:
     # API publica
 
     def index(self, chunk_result: ChunkResult) -> IndexSummary:
-        """
-        Indexa um ChunkResult completo no ChromaDB.
-
-        E uma operacao idempotente: chunks cujo ID ja existe na colecao
-        sao ignorados (deduplicacao). Isso permite re-indexar o mesmo edital
-        sem gerar duplicatas.
-
-        Parents sao indexados primeiro porque os children referenciam seus IDs.
-        """
+        """Indexa um ChunkResult completo e idempotente no ChromaDB."""
         start = time.time()
         warnings: list[str] = []
 
@@ -227,16 +189,7 @@ class EditalIndexer:
         contains_date: Optional[bool] = None,
         contains_value: Optional[bool] = None,
     ) -> list[SearchResult]:
-        """
-        Busca semantica hibrida: embedding + filtro de metadados.
-
-        O filtro e opcional. Quando informado, o ChromaDB restringe a busca
-        apenas aos chunks que satisfazem a condicao antes de calcular
-        similaridade — isso e mais eficiente que filtrar pos-busca.
-
-        Retorna lista de SearchResult com o child encontrado e o parent
-        correspondente ja expandido (lookup por ID na colecao de parents).
-        """
+        """Busca semantica hibrida com extracao segura de tipos para blindar o Grafo Agentico."""
         where = self._build_where_filter(chunk_type, edital_id, contains_date, contains_value)
 
         query_kwargs = {
@@ -259,40 +212,82 @@ class EditalIndexer:
         seen_parents: set[str] = set()
 
         for i, child_id in enumerate(raw["ids"][0]):
-            meta       = raw["metadatas"][0][i]
-            child_text = raw["documents"][0][i]
+            meta       = raw["metadatas"][0][i] or {}
+            child_text = raw["documents"][0][i] or ""
             score      = raw["distances"][0][i]
-            parent_id  = meta.get("parent_id", "")
+            parent_id  = str(meta.get("parent_id", ""))
 
-            # Deduplicar por parent: se dois children do mesmo parent
-            # aparecem no resultado, retornamos apenas o de menor score.
             if parent_id in seen_parents:
                 continue
             seen_parents.add(parent_id)
 
+            # Processamento seguro das referencias cruzadas salvas como string separada por virgula
+            raw_refs = meta.get("referenced_clauses", "")
+            ref_list = [r.strip() for r in raw_refs.split(",") if r.strip()] if raw_refs else []
+
             results.append(SearchResult(
-                child_id=child_id,
-                child_text=child_text,
-                child_score=round(score, 4),
+                child_id=str(child_id),
+                child_text=str(child_text),
+                child_score=round(float(score), 4),
                 parent_id=parent_id,
                 parent_text=self._fetch_parent_text(parent_id),
-                chunk_type=meta.get("chunk_type", "outro"),
-                section_title=meta.get("section_title", ""),
-                clause_id=meta.get("clause_id", ""),
+                chunk_type=str(meta.get("chunk_type", "outro")),
+                section_title=str(meta.get("section_title", "")),
+                clause_id=str(meta.get("clause_id", "")),
                 page_start=int(meta.get("page_start", 0)),
-                contains_date=bool(meta.get("contains_date", 0)),
-                contains_value=bool(meta.get("contains_value", 0)),
-                source_file=meta.get("source_file", ""),
-                edital_id=meta.get("edital_id", ""),
+                contains_date=bool(int(meta.get("contains_date", 0))),
+                contains_value=bool(int(meta.get("contains_value", 0))),
+                source_file=str(meta.get("source_file", "")),
+                edital_id=str(meta.get("edital_id", "")),
+                referenced_clauses=ref_list
             ))
 
         return results
 
+    def fetch_by_clause_id(self, clause_id: str, edital_id: str) -> Optional[SearchResult]:
+        """
+        Busca direta e exata por Clausula ID (Ex: '5.1.2').
+        Permite ao Agente resolver referencias cruzadas descobertas em tempo de execucao.
+        """
+        where = {
+            "$and": [
+                {"clause_id": {"$eq": clause_id}},
+                {"edital_id": {"$eq": edital_id}}
+            ]
+        }
+        
+        try:
+            # Consultamos a colecao de children usando apenas os metadados como chave de busca
+            raw = self._col_children.get(where=where, limit=1, include=["documents", "metadatas"])
+            if not raw["ids"]:
+                return None
+                
+            meta = raw["metadatas"][0]
+            parent_id = str(meta.get("parent_id", ""))
+            raw_refs = meta.get("referenced_clauses", "")
+            ref_list = [r.strip() for r in raw_refs.split(",") if r.strip()] if raw_refs else []
+
+            return SearchResult(
+                child_id=str(raw["ids"][0]),
+                child_text=str(raw["documents"][0]),
+                child_score=0.0, # Busca exata por ID nao possui distancia cossena relevante
+                parent_id=parent_id,
+                parent_text=self._fetch_parent_text(parent_id),
+                chunk_type=str(meta.get("chunk_type", "outro")),
+                section_title=str(meta.get("section_title", "")),
+                clause_id=str(meta.get("clause_id", "")),
+                page_start=int(meta.get("page_start", 0)),
+                contains_date=bool(int(meta.get("contains_date", 0))),
+                contains_value=bool(int(meta.get("contains_value", 0))),
+                source_file=str(meta.get("source_file", "")),
+                edital_id=str(meta.get("edital_id", "")),
+                referenced_clauses=ref_list
+            )
+        except Exception:
+            return None
+
     def delete_edital(self, edital_id: str) -> dict:
-        """
-        Remove todos os chunks de um edital das duas colecoes.
-        Util para re-indexar um edital com conteudo atualizado.
-        """
+        """Remove de forma idempotente todos os registros vinculados a um edital."""
         where    = {"edital_id": {"$eq": edital_id}}
         c_before = self._col_children.count()
         p_before = self._col_parents.count()
@@ -317,11 +312,7 @@ class EditalIndexer:
     # Internos
 
     def _get_or_create_collection(self, name: str, embed: bool) -> chromadb.Collection:
-        """
-        Cria ou recupera uma colecao ChromaDB.
-        A distancia coseno e usada porque embeddings normalizados se comportam
-        melhor com coseno do que com distancia euclidiana para tarefas semanticas.
-        """
+        """Cria ou recupera uma colecao configurada no espaco vetorial de cosseno."""
         kwargs: dict = {"name": name}
         if embed and self._embedding_fn is not None:
             kwargs["embedding_function"] = self._embedding_fn
@@ -337,13 +328,7 @@ class EditalIndexer:
         chunks: list[Chunk],
         embed: bool,
     ) -> tuple[int, int]:
-        """
-        Insere chunks em batches, pulando os que ja existem.
-        Retorna (n_inseridos, n_pulados).
-
-        Parents sao inseridos com embedding dummy ([0.0]) porque nunca sao
-        buscados por similaridade — apenas recuperados por ID.
-        """
+        """Insere chunks de forma segmentada pulando duplicatas por ID."""
         if not chunks:
             return 0, 0
 
@@ -357,8 +342,6 @@ class EditalIndexer:
         total_batches = (len(to_insert) + BATCH_SIZE - 1) // BATCH_SIZE
 
         for i, batch in enumerate(self._batches(to_insert, BATCH_SIZE), 1):
-            print(f"   Lote {i}/{total_batches} ({len(batch)} chunks)...")
-
             ids       = [c.id for c in batch]
             documents = [c.text for c in batch]
             metadatas = [self._sanitize_metadata(c.metadata) for c in batch]
@@ -374,14 +357,12 @@ class EditalIndexer:
         return len(to_insert), n_skipped
 
     def _get_existing_ids(self, collection: chromadb.Collection, ids: list[str]) -> set[str]:
-        """Consulta o ChromaDB para saber quais IDs ja existem na colecao."""
         try:
             return set(collection.get(ids=ids, include=[])["ids"])
         except Exception:
             return set()
 
     def _fetch_parent_text(self, parent_id: str) -> str:
-        """Recupera o texto de um parent pelo ID. Retorna string vazia se nao encontrado."""
         if not parent_id:
             return ""
         try:
@@ -399,11 +380,6 @@ class EditalIndexer:
         contains_date: Optional[bool],
         contains_value: Optional[bool],
     ) -> Optional[dict]:
-        """
-        Monta o filtro 'where' do ChromaDB combinando as condicoes informadas.
-        Condicoes multiplas sao unidas com $and.
-        Retorna None se nenhum filtro for informado (busca sem restricao).
-        """
         conditions = []
         if chunk_type:
             conditions.append({"chunk_type":  {"$eq": chunk_type}})
@@ -422,12 +398,6 @@ class EditalIndexer:
 
     @staticmethod
     def _sanitize_metadata(metadata: dict) -> dict:
-        """
-        Prepara metadados para o ChromaDB.
-        O ChromaDB aceita apenas str, int e float como valores de metadado.
-        Booleanos precisam ser convertidos para int para funcionar em filtros.
-        Listas sao convertidas para string separada por virgula.
-        """
         clean = {}
         for k, v in metadata.items():
             if v is None:
@@ -435,6 +405,7 @@ class EditalIndexer:
             if isinstance(v, bool):
                 clean[k] = int(v)
             elif isinstance(v, list):
+                # Conversao limpa para strings separadas por virgula aceitas pelo Chroma
                 clean[k] = ",".join(str(x) for x in v)
             elif isinstance(v, (str, int, float)):
                 clean[k] = v
@@ -444,7 +415,6 @@ class EditalIndexer:
 
     @staticmethod
     def _batches(items: list, size: int):
-        """Divide uma lista em sublistas de tamanho maximo 'size'."""
         for i in range(0, len(items), size):
             yield items[i: i + size]
 

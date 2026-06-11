@@ -1,16 +1,99 @@
+"""
+agent.py
+========
+Orquestração em Grafo (LangGraph) para o pipeline Agentic RAG de Editais Públicos.
+"""
+
 from typing import List, Optional, TypedDict
 from typing_extensions import Literal
-from dataclasses import dataclass
 import time
+import re
+from dataclasses import dataclass
 
 from langchain_core.prompts import PromptTemplate
 from langchain_ollama import OllamaLLM
 from langgraph.graph import StateGraph, START, END
 
 from ingestion.indexer import EditalIndexer, SearchResult
-from retriever import detect_intent, PROMPT, SCORE_THRESHOLD, RAGResponse, SourceReference
 
-# 1. Definição do Estado do Grafo
+# ===========================================================================
+# 1. ESTRUTURAS COMPARTILHADAS (Trazidas para cá para evitar import circular)
+# ===========================================================================
+
+SCORE_THRESHOLD = 0.55
+
+@dataclass
+class SourceReference:
+    """Referencia de fonte para exibicao na interface."""
+    chunk_type: str
+    section_title: str
+    clause_id: str
+    page: int
+    score: float
+    excerpt: str
+    source_file: str
+
+@dataclass
+class RAGResponse:
+    """Resposta completa do pipeline, incluindo metadados de rastreabilidade."""
+    question: str
+    answer: str
+    sources: list
+    detected_intent: Optional[str]
+    n_chunks_retrieved: int
+    chunks_above_threshold: int
+    duration_seconds: float
+    warning: Optional[str] = None
+
+# Padrões do Roteador por Regex
+_INTENT_PATTERNS = [
+    ([r"\bprazo\b", r"\bdata\b", r"\bquando\b", r"\bencerra\b", r"\blimite\b", r"\bvalidade\b", r"\babertura\b", r"\bvigencia\b"], "prazo"),
+    ([r"\bdocumentos?\b", r"\bcertid[ao]\b", r"\batestado\b", r"\bcomprovante\b", r"\bhabilitacao\b", r"\bobrigatori", r"\bexigid", r"\brequisito\b", r"\bapresentar\b"], "documento_obrigatorio"),
+    ([r"\bdesclassifica", r"\binabilita", r"\bimpedimento\b", r"\bveda\b", r"\bproibid", r"\belimina", r"\bexclui"], "criterio_desclassificacao"),
+    ([r"\bobjeto\b", r"\bcontratacao\b", r"\baquisicao\b", r"\bfornecimento\b", r"\bservico\b"], "objeto"),
+]
+
+_INTENT_PRIORITY = ["criterio_desclassificacao", "prazo", "documento_obrigatorio", "objeto"]
+
+def detect_intent(question: str) -> Optional[str]:
+    q = question.lower()
+    scores: dict[str, int] = {}
+    for patterns, chunk_type in _INTENT_PATTERNS:
+        score = sum(1 for p in patterns if re.search(p, q))
+        if score > 0:
+            scores[chunk_type] = score
+    if not scores:
+        return None
+    max_score = max(scores.values())
+    best = next((p for p in _INTENT_PRIORITY if scores.get(p, 0) == max_score), max(scores, key=lambda k: scores[k]))
+    if max_score >= 2 or (max_score == 1 and len(question.split()) <= 10):
+        return best
+    return None
+
+# Prompt Mestre
+_TEMPLATE = """Voce e um especialista em analise de editais publicos brasileiros.
+Responda a pergunta com base EXCLUSIVAMENTE nos trechos do edital abaixo.
+
+REGRAS:
+1. Use apenas as informacoes dos trechos. Nunca invente dados.
+2. Se a informacao nao estiver nos trechos, diga: "Nao encontrei essa informacao nos trechos recuperados do edital."
+3. Ao citar prazos, datas ou valores, indique sempre a pagina ou clausula de origem.
+4. Seja objetivo e direto. Use bullet points para listas.
+5. Responda em portugues brasileiro.
+
+TRECHOS DO EDITAL:
+{context}
+
+PERGUNTA: {question}
+
+RESPOSTA:"""
+
+PROMPT = PromptTemplate(input_variables=["context", "question"], template=_TEMPLATE)
+
+# ===========================================================================
+# 2. DEFINIÇÃO DO ESTADO E DO GRAFO (Continua igual)
+# ===========================================================================
+
 class AgentState(TypedDict):
     question: str
     current_query: str
@@ -21,36 +104,40 @@ class AgentState(TypedDict):
     answer: str
     sources: list
 
-# Configuração Base
+# Configurações do Ciclo
 DEFAULT_MODEL = "llama3"
-MAX_LOOPS = 2  # Impede loops infinitos de reescrita de query
+MAX_LOOPS = 2  # Proteção contra loops infinitos de reescrita
 
 class EditalAgentGraph:
+    """
+    Substitui a execução linear por uma máquina de estados agêntica.
+    Navega dinamicamente entre busca, crítica e reformulação de perguntas.
+    """
+
     def __init__(self, indexer: EditalIndexer, model: str = DEFAULT_MODEL, edital_id: Optional[str] = None):
         self.indexer = indexer
-        self.edital_id = edital_id
-        self._llm = OllamaLLM(model=model, temperature=0.0)
+        self.edital_id = edital_id  # Mantém o isolamento multi-tenant do app.py
+        self._llm = OllamaLLM(model=model, temperature=0.0)  # Temperatura zero para auditoria
         self.graph = self._build_graph()
 
     # ==========================================
-    # NÓS (NODES)
+    # NÓS DE EXECUÇÃO (NODES)
     # ==========================================
 
     def node_route_and_search(self, state: AgentState) -> dict:
-        """Determina a intenção e faz a busca inicial ou subsequente no ChromaDB."""
+        """Determina o foco temático e interage de forma híbrida com o ChromaDB."""
         question = state["question"]
         current_query = state.get("current_query", question)
         loop_count = state.get("loop_count", 0)
 
-        # Se for a primeira rodada, detecta a intenção por Regex (seu método atual)
-        intent = state.get("intent") or detect_intent(current_query)
+        # Na primeira iteração, tenta o roteamento leve via regex do retriever.py
+        intent = state.get("intent") if loop_count > 0 else detect_intent(current_query)
         
-        # Simula sua busca híbrida do retriever.py
-        # Nota: Ajuste a chamada de acordo com a assinatura exata do seu indexer
         seen = set()
         merged = []
         n_results = 4
 
+        # Integração direta e segura com o método search() do seu indexer.py
         if intent:
             for r in self.indexer.search(query=current_query, n_results=n_results, chunk_type=intent, edital_id=self.edital_id):
                 if r.parent_id not in seen:
@@ -73,15 +160,13 @@ class EditalAgentGraph:
         }
 
     def node_grade_documents(self, state: AgentState) -> dict:
-        """O Agente avalia a relevância de cada documento recuperado em relação à pergunta."""
+        """Agente de Crítica: Filtra alucinações avaliando a utilidade real dos blocos."""
         question = state["question"]
         results = state["results"]
         relevant_chunks = []
 
-        # Primeiro filtro rápido por distância de cosseno (seu threshold matemático)
+        # Casamento perfeito com a métrica de distância cossena definida no seu retriever
         hard_filtered = [r for r in results if r.child_score <= SCORE_THRESHOLD]
-        
-        # Se o filtro por score esvaziar tudo, analisamos o bloco completo via LLM (Filtro Semântico Crítico)
         chunks_to_grade = hard_filtered if hard_filtered else results
 
         for chunk in chunks_to_grade:
@@ -91,7 +176,7 @@ class EditalAgentGraph:
             Trecho: {text}
             Pergunta: {question}
             
-            Responda APENAS com a palavra 'SIM' se for relevante ou 'NAO' se for irrelevante. Não justifique.
+            Responda APENAS com a palavra 'SIM' se for relevante ou 'NAO' se for irrelevante. Não mude a grafia.
             Veredito:"""
             
             verdict = self._llm.invoke(prompt).strip().upper()
@@ -101,24 +186,22 @@ class EditalAgentGraph:
         return {"relevant_chunks": relevant_chunks}
 
     def node_rewrite_query(self, state: AgentState) -> dict:
-        """Reescreve a pergunta usando termos formais de licitação se a busca falhar."""
+        """Agente de Tradução: Transforma termos leigos para a linguagem burocrática de licitações."""
         current_query = state["current_query"]
         
-        prompt = f"""Você é um especialista em licitações públicas brasileiras. O sistema de busca falhou em encontrar trechos relevantes para a pergunta: '{current_query}'.
-        Reescreva essa pergunta usando sinônimos técnicos, jargões formais de editais e termos correlatos para otimizar a busca semântica em um banco vetorial.
-        Retorne APENAS a nova pergunta reformulada, sem introduções ou explicações.
+        prompt = f"""Você é um consultor especialista em licitações públicas brasileiras. O sistema falhou em localizar respostas para a busca: '{current_query}'.
+        Reescreva essa dúvida usando termos formais de editais, jargões jurídicos (ex: certidões ao invés de papéis) e sinônimos da Lei 14.133 para otimizar os vetores.
+        Retorne EXCLUSIVAMENTE a nova linha de pergunta, sem preâmbulos ou aspas.
         Nova Pergunta:"""
         
         new_query = self._llm.invoke(prompt).strip()
         return {"current_query": new_query}
 
     def node_generate_answer(self, state: AgentState) -> dict:
-        """Monta o contexto final com os pedaços aprovados e gera a resposta."""
+        """Nó de Síntese: Monta o contexto final enriquecido e executa o prompt mestre."""
         question = state["question"]
-        # Se nenhum pedaço foi considerado relevante pelos agentes, usa os resultados brutos como fallback
         final_chunks = state["relevant_chunks"] if state["relevant_chunks"] else state["results"]
 
-        # Reaproveitando sua lógica estrutural de montagem de contexto
         parts = []
         sources = []
         for i, r in enumerate(final_chunks, 1):
@@ -141,37 +224,36 @@ class EditalAgentGraph:
         return {"answer": answer, "sources": sources}
 
     # ==========================================
-    # BORDAS CONDICIONAIS (ROUTING EDGES)
+    # LOGICA CONDICIONAL DE ROTEAMENTO
     # ==========================================
 
     def decide_to_generate(self, state: AgentState) -> Literal["generate", "rewrite", "force_generate"]:
-        """Avalia se temos dados suficientes para responder ou se precisamos reescrever a query."""
         if state["relevant_chunks"]:
-            return "generate"  # Temos documentos validados!
+            return "generate"
         
         if state["loop_count"] >= MAX_LOOPS:
-            return "force_generate"  # Estourou o limite de tentativas, gera com o que tem.
+            return "force_generate"
             
-        return "rewrite"  # Nenhum documento útil e ainda temos tentativas. Reescrever query.
+        return "rewrite"
 
     # ==========================================
-    # CONSTRUÇÃO DO GRAFO
+    # COMPILAÇÃO DA ESTRUTURA DO GRAFO
     # ==========================================
 
     def _build_graph(self):
         workflow = StateGraph(AgentState)
 
-        # Adiciona os Nós
+        # Mapeamento de Nós
         workflow.add_node("route_and_search", self.node_route_and_search)
         workflow.add_node("grade_documents", self.node_grade_documents)
         workflow.add_node("rewrite_query", self.node_rewrite_query)
         workflow.add_node("generate_answer", self.node_generate_answer)
 
-        # Define o Fluxo Inicial
+        # Conexões fixas
         workflow.add_edge(START, "route_and_search")
         workflow.add_edge("route_and_search", "grade_documents")
 
-        # Define as Pontes de Decisão Condicional
+        # Conexões Dinâmicas/Bordas Condicionais
         workflow.add_conditional_edges(
             "grade_documents",
             self.decide_to_generate,
@@ -182,26 +264,24 @@ class EditalAgentGraph:
             }
         )
 
-        # Fecha os loops de volta para a busca
         workflow.add_edge("rewrite_query", "route_and_search")
         workflow.add_edge("generate_answer", END)
 
         return workflow.compile()
 
     # ==========================================
-    # INTERFACE COMPATÍVEL (.ask())
+    # MÉTODO ASK COMPATÍVEL COM APP.PY
     # ==========================================
 
     def ask(self, question: str) -> RAGResponse:
         start_time = time.time()
         
-        # Executa a máquina de estados carregando o dicionário inicial
         inputs = {"question": question, "loop_count": 0}
         output = self.graph.invoke(inputs)
 
         warning = None
         if not output.get("relevant_chunks"):
-            warning = "Aviso: O agente crítico considerou os trechos recuperados irrelevantes após reescrita. Resposta sob risco de alucinação."
+            warning = "O agente considerou os trechos recuperados imprecisos após tentativas de reescrita. Resposta gerada sob risco de omissão."
 
         return RAGResponse(
             question=question,

@@ -1,15 +1,10 @@
 """
 app.py
 ======
-Interface Streamlit para o sistema RAG de análise de editais públicos.
+Interface Streamlit para o sistema RAG Agêntico de análise de editais públicos.
 
 Execução:
     streamlit run app.py
-
-Requisitos:
-    - Ollama rodando: ollama serve
-    - Modelos baixados: ollama pull llama3 && ollama pull nomic-embed-text
-    - Dependências: pip install streamlit langchain-core langchain-ollama chromadb pymupdf
 """
 
 import os
@@ -244,24 +239,25 @@ hr { border-color: #1e2a3a !important; }
 
 
 # ---------------------------------------------------------------------------
-# Imports do pipeline — com tratamento de erro amigável
+# Imports do pipeline — Adaptado para carregar o Grafo Agêntico do LangGraph
 # ---------------------------------------------------------------------------
 
 @st.cache_resource(show_spinner=False)
 def load_pipeline(model: str, persist_dir: str):
     """
-    Inicializa o indexer e o retriever uma única vez (cache do Streamlit).
+    Inicializa o indexer e o agente em grafo uma única vez (cache do Streamlit).
     Re-executa apenas se model ou persist_dir mudarem.
     """
     from ingestion.indexer import EditalIndexer, OllamaEmbedder
-    from retriever import EditalRetriever
+    from agent import EditalAgentGraph  # Carrega nossa arquitetura agêntica compilada
 
     indexer = EditalIndexer(
         persist_dir=persist_dir,
         embedding_fn=OllamaEmbedder(),
     )
-    retriever = EditalRetriever(indexer=indexer, model=model)
-    return indexer, retriever
+    # Instanciamos o grafo agêntico encapsulado que criamos no passo anterior
+    agent_graph = EditalAgentGraph(indexer=indexer, model=model)
+    return indexer, agent_graph
 
 
 # ---------------------------------------------------------------------------
@@ -269,8 +265,8 @@ def load_pipeline(model: str, persist_dir: str):
 # ---------------------------------------------------------------------------
 
 INTENT_LABELS = {
-    "prazo":                     ("prazo",     "intent-prazo"),
-    "documento_obrigatorio":     ("documento", "intent-documento"),
+    "prazo":                    ("prazo",     "intent-prazo"),
+    "documento_obrigatorio":    ("documento", "intent-documento"),
     "criterio_desclassificacao": ("critério",  "intent-criterio"),
     "objeto":                    ("objeto",    "intent-objeto"),
     None:                        ("geral",     "intent-geral"),
@@ -508,11 +504,11 @@ with st.sidebar:
 # Hero header
 st.markdown("""
 <div class="hero-header">
-    <div class="hero-badge">RAG · Editais Públicos · Powered by Ollama</div>
+    <div class="hero-badge">Agentic RAG · LangGraph · Powered by Ollama</div>
     <div class="hero-title">EditalIA</div>
     <div class="hero-subtitle">
-        Análise inteligente de editais de licitação, concursos públicos e vestibulares.<br>
-        Faça perguntas sobre prazos, documentos obrigatórios e critérios de desclassificação.
+        Análise inteligente de editais através de agentes autônomos de reflexão gráfica.<br>
+        O sistema avalia a qualidade do contexto e reescreve queries dinamicamente em caso de falhas.
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -609,20 +605,21 @@ else:
             unsafe_allow_html=True,
         )
 
-        # Gerar resposta
+        # Gerar resposta via Agente LangGraph
         try:
-            _, retriever = load_pipeline(
+            _, agent_graph = load_pipeline(
                 st.session_state["model"],
                 st.session_state["persist_dir"],
             )
 
-            # Restringir ao edital ativo
-            retriever.edital_id = st.session_state["active_edital"]
+            # Restringir as buscas do Grafo ao edital ativo configurado na sessão
+            agent_graph.edital_id = st.session_state["active_edital"]
 
-            with st.spinner("Consultando o edital..."):
-                response = retriever.ask(question)
+            # Usamos o st.spinner enquanto o LangGraph navega pelos nós (Search, Grade, Rewrite)
+            with st.spinner("Agente analisando o edital e avaliando consistência..."):
+                response = agent_graph.ask(question)
 
-            # Armazenar no histórico
+            # Armazenar no histórico o payload retornado pelo grafo (idêntico ao RAGResponse original)
             st.session_state["messages"].append({
                 "role":    "assistant",
                 "content": response.answer,
@@ -636,5 +633,5 @@ else:
             st.rerun()
 
         except Exception as e:
-            st.error(f"Erro ao consultar: {e}")
-            st.info("Verifique se o Ollama está rodando: `ollama serve`")
+            st.error(f"Erro na execução do loop agêntico: {e}")
+            st.info("Verifique se as instâncias do ChromaDB e Ollama estão operacionais.")
