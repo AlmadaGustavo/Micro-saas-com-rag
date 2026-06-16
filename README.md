@@ -22,7 +22,7 @@ Diferente de sistemas RAG tradicionais que executam buscas lineares e estáticas
 Abaixo está o mapeamento da máquina de estados finitos que controla o ciclo de vida de uma consulta no backend do sistema:
 
 [ Pergunta do Usuário ]
-                         │
+
                          ▼
               ┌────────────────────┐
               │  route_and_search  │ ◄───────────────────┐
@@ -43,6 +43,7 @@ Abaixo está o mapeamento da máquina de estados finitos que controla o ciclo de
                  │                             (Geração Final)
                  └── NÃO ────────────────► [ rewrite_query ]
                                                (Agente Tradutor)
+                                               
 ### Componentes e Módulos do Sistema
 
 * **`ingestion/pdf_extractor.py`**: Camada de extração estrutural. Avalia a tipografia do PDF através do PyMuPDF, mapeia a hierarquia física e realiza a classificação semântica inicial.
