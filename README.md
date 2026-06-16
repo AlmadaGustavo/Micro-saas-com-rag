@@ -1,220 +1,127 @@
-# Micro-saas-com-rag
-# EditalIA — Análise Inteligente de Editais Públicos
+# EditalIA — Análise Inteligente de Editais Públicos com Agentic RAG
 
-Sistema de perguntas e respostas sobre editais de licitação, concursos públicos e vestibulares, baseado em RAG (Retrieval-Augmented Generation) com modelos de linguagem locais via Ollama.
-
----
-
-## Equipe
-Gustavo Morais de Almada             
-Rafael Santos             
-Gabriel Pepes Moda
+O **EditalIA** é um sistema de auditoria, perguntas e respostas sobre editais de licitação, concursos públicos e vestibulares. O projeto utiliza uma arquitetura avançada de **Agentic RAG (Retrieval-Augmented Generation)** controlada por um grafo de estados para implementar loops autônomos de avaliação e auto-correção (*Self-RAG*), utilizando modelos de linguagem e embeddings locais via Ollama.
 
 ---
 
-## Descrição do Projeto
-
-O EditalIA permite que o usuário faça upload de um PDF de edital e faça perguntas em linguagem natural sobre o documento. O sistema recupera os trechos mais relevantes e gera uma resposta fundamentada, citando a página e a cláusula de origem.
-
-Exemplos de perguntas suportadas:
-
-- Qual o prazo para entrega das propostas?
-- Quais documentos são obrigatórios para habilitação?
-- Quais são os critérios de desclassificação?
-- Qual o objeto desta licitação?
+## 👥 Equipe
+* **Gustavo Morais de Almada** * **Rafael Santos** * **Gabriel Pepes Moda**
 
 ---
 
-## Arquitetura
+## 📝 Descrição do Projeto
 
-```
-PDF do edital
-     │
-     ▼
-pdf_extractor.py   — Extrai blocos de texto com metadados tipográficos (PyMuPDF)
-     │
-     ▼
-chunker.py         — Gera pares Parent-Child via chunking hierárquico
-     │
-     ▼
-indexer.py         — Persiste no ChromaDB com embeddings via Ollama
-     │
-     ▼
-retriever.py       — Busca híbrida + expansão de contexto + geração via LLM
-     │
-     ▼
-app.py             — Interface Streamlit
-```
+O **EditalIA** permite que analistas de mercado e inteligência de negócios façam upload de editais públicos em formato PDF e realizem consultas em linguagem natural. 
 
-### Estratégia de Chunking
-
-O sistema usa **Parent-Child chunking** em dois níveis:
-
-- **Parent (~700 tokens):** contexto completo de uma cláusula. Enviado ao LLM para geração da resposta.
-- **Child (~175 tokens):** fragmento menor do mesmo trecho. Indexado por embedding para busca semântica precisa.
-
-Na recuperação, o sistema busca pelos children (semântica fina) e expande para os parents (contexto completo) antes de montar o prompt.
-
-### Metadados por Chunk
-
-Cada chunk carrega metadados filtráveis no ChromaDB:
-
-| Metadado | Descrição |
-|---|---|
-| `chunk_type` | Classificação semântica: `prazo`, `documento_obrigatorio`, `criterio_desclassificacao`, `objeto`, `outro` |
-| `section_title` | Título da seção pai (ex: "3. DA HABILITAÇÃO") |
-| `clause_id` | Número da cláusula (ex: "3.1.2") |
-| `page_start` | Página do PDF onde o trecho começa |
-| `contains_date` | `1` se o chunk contém uma data no formato DD/MM/AAAA |
-| `contains_value` | `1` se o chunk contém um valor monetário (R$) |
-| `edital_id` | SHA-256 (8 chars) do arquivo — permite múltiplos editais no mesmo banco |
+Diferente de sistemas RAG tradicionais que executam buscas lineares e estáticas, o EditalIA atua como um **agente autônomo de tomada de decisão**. Ele analisa a qualidade dos documentos recuperados, valida a relevância semântica em relação à dúvida do usuário e, caso a busca inicial falhe ou seja ambígua, reescreve a pergunta de forma técnica para forçar uma nova varredura resiliente no banco vetorial antes de sintetizar a resposta final com rastreabilidade de fontes.
 
 ---
 
-## Stack Tecnológica
+## 🏗️ Arquitetura do Sistema (Fluxo Agêntico)
 
-| Componente | Tecnologia |
-|---|---|
-| Linguagem | Python 3.10+ |
-| Extração de PDF | PyMuPDF (fitz) |
-| Banco vetorial | ChromaDB |
-| Embeddings | nomic-embed-text via Ollama |
-| LLM | Llama 3 / Mistral via Ollama |
-| Orquestração | LangChain Core |
-| Interface | Streamlit |
+Abaixo está o mapeamento da máquina de estados finitos que controla o ciclo de vida de uma consulta no backend do sistema:
+
+[ Pergunta do Usuário ]
+                         │
+                         ▼
+              ┌────────────────────┐
+              │  route_and_search  │ ◄───────────────────┐
+              │  (Busca Híbrida)   │                     │
+              └──────────┬─────────┘                     │
+                         │                               │
+                         ▼                               │
+              ┌────────────────────┐                     │
+              │  grade_documents   │                     │
+              │ (Agente Crítico)   │                     │
+              └──────────┬─────────┘                     │
+                         │                               │
+                         ├───────────────────────────────┤ (Se a busca falhar
+                         │ Condicional:                  │  e loop_count < 2)
+                         ▼ decide_to_generate            │
+               [ relevant_chunks? ]                      │
+                 ├── SIM ────────────────► [ generate_answer ]
+                 │                             (Geração Final)
+                 └── NÃO ────────────────► [ rewrite_query ]
+                                               (Agente Tradutor)
+### Componentes e Módulos do Sistema
+
+* **`ingestion/pdf_extractor.py`**: Camada de extração estrutural. Avalia a tipografia do PDF através do PyMuPDF, mapeia a hierarquia física e realiza a classificação semântica inicial.
+* **`ingestion/chunker.py`**: Camada de processamento hierárquico. Implementa a estratégia *Parent-Child* e aplica algoritmos de correção de fragmentos órfãos em listas e resoluções.
+* **`ingestion/indexer.py`**: Interface de persistência com o ChromaDB. Gerencia coleções isoladas para os pares hierárquicos e expõe métodos para busca híbrida e recuperação por ID exato (`fetch_by_clause_id`).
+* **`agent.py`**: O cérebro do ecossistema. Implementa a máquina de estados através do **LangGraph**, gerenciando os nós de execução, avaliação crítica, loops de auto-correção e as bordas de roteamento condicional.
+* **`app.py`**: Camada de interface de usuário construída em Streamlit, alimentada pelas respostas estruturadas do grafo.
 
 ---
 
-## Pré-requisitos
+## 🗂️ Estratégia Avançada de Dados
 
-- Python 3.10 ou superior
-- [Ollama](https://ollama.com/download) instalado e rodando
+### 1. Chunking Hierárquico Parent-Child
+Para garantir que a busca vetorial opere com alta precisão sem que o LLM perca o contexto periférico do documento, o sistema cinde os dados em duas coleções distintas no ChromaDB:
+* **Parents (`editais_parents`):** Blocos robustos de até **700 tokens** com a cláusula ou seção jurídica completa. Não geram vetores de embedding (armazenados com vetor dummy `[0.0]`) e são injetados diretamente no prompt do LLM.
+* **Children (`editais_children`):** Subdivisões do bloco pai com até **175 tokens**, indexadas com embeddings reais para máxima aderência matemática na busca semântica. Cada registro filho carrega o ID do seu respectivo pai.
+
+### 2. Metadados e Suporte a Multi-Hop (Referências Cruzadas)
+Cada bloco vetorial armazena metadados primitivos para pré-filtragem acelerada e rastreabilidade:
+
+| Metadado | Tipo | Função no Sistema |
+|---|---|---|
+| `chunk_type` | `str` | Classificação do tema: `prazo`, `documento_obrigatorio`, `criterio_desclassificacao`, `objeto`, `cabecalho`, `outro` |
+| `clause_id` | `str` | Identificador numérico exato da cláusula (Ex: `5.1.2`) |
+| `page_start` | `int` | Número da página de origem no PDF para citação compulsória |
+| `contains_date` | `int` | Flag booleano (`1` ou `0`) para identificar presença de cronogramas |
+| `contains_value` | `int` | Flag booleano (`1` ou `0`) para identificar dotações orçamentárias |
+| `referenced_clauses`| `str` | Lista de referências cruzadas mapeadas por regex (Ex: `4.1.1,8.2`) salvas como string separada por vírgula para permitir buscas em cascata (*Multi-Hop Retrieval*). |
+| `edital_id` | `str` | Hash SHA-256 estável do arquivo, garantindo isolamento multi-tenant de dados |
 
 ---
 
-## Instalação
+## 🛠️ O Loop de Decisão Agêntica (Self-RAG)
 
-**1. Clonar o repositório:**
+O pipeline implementado no módulo `agent.py` elimina o comportamento estático do RAG clássico através de 4 nós cognitivos:
 
+1. **Roteamento Temático e Busca (`node_route_and_search`):** Executa o algoritmo de intenção na pergunta. Se uma palavra-chave ativar um padrão, o grafo injeta um filtro `where` nativo no ChromaDB para buscar apenas na subcategoria correspondente, reduzindo o espaço de busca. Em seguida, os filhos encontrados são expandidos para seus blocos pais originais.
+2. **Auditoria Crítica (`node_grade_documents`):** O LLM é instanciado em modo de avaliação restrita (temperatura `0.0`). Ele lê a pergunta do usuário e cada um dos blocos retornados individualmente, emitindo um veredito binário (`SIM` ou `NAO`) se aquele trecho possui utilidade factual para a resposta.
+3. **Avaliação Estatística de Estado (`decide_to_generate`):** Uma borda condicional avalia o estado do grafo. Se houver blocos aprovados, o fluxo avança para a síntese. Se nenhum bloco for aprovado, o estado incrementa o `loop_count` e desvia o fluxo para a agência de correção.
+4. **Reformulação Cognitiva da Query (`node_rewrite_query`):** O LLM atua como um tradutor técnico de mercado. Ele analisa a pergunta que falhou e a reescreve utilizando sinônimos formais de compras públicas e jargões da Lei 14.133 para otimizar a aproximação dos vetores em uma nova tentativa de busca automática.
+
+---
+
+## 💻 Stack Tecnológica
+
+* **Linguagem:** Python 3.10+
+* **Orquestração Agêntica:** LangGraph & LangChain Core
+* **Interface Gráfica:** Streamlit
+* **Banco de Vetores:** ChromaDB
+* **Extração de PDF e Tipografia:** PyMuPDF (fitz)
+* **Modelos Locais (Ollama):**
+  * *LLM:* Llama 3 (8B) / Mistral (7B) com temperatura `0.0`
+  * *Embeddings:* `nomic-embed-text` (Modelo multilíngue de alta performance para a língua portuguesa)
+
+---
+
+## 🚀 Instalação e Execução
+
+**1. Clonar o repositório e acessar a pasta:**
 ```bash
 git clone <url-do-repositorio>
-cd <nome-do-repositorio>
-```
+cd Micro-saas-com-rag
 
-**2. Criar ambiente virtual e instalar dependências:**
-
-```bash
 python -m venv .venv
 
-# Windows
+# Ativação no Windows
 .venv\Scripts\activate
 
-# Linux / macOS
+# Ativação no Linux/macOS
 source .venv/bin/activate
 
 pip install -r requirements.txt
-```
 
-**3. Baixar os modelos no Ollama:**
-
-```bash
+ollama serve
 ollama pull llama3
 ollama pull nomic-embed-text
-```
+````
 
----
+## Execução do projeto
 
-## Execução
-
-**1. Iniciar o Ollama** (se não estiver rodando):
-
-```bash
-ollama serve
-```
-
-**2. Iniciar a interface:**
-
-```bash
-streamlit run app.py
-```
-
-**3. Usar o sistema:**
-
-1. Faça upload de um PDF de edital no painel lateral
-2. Clique em "Processar e Indexar" e aguarde a indexação
-3. Digite sua pergunta na caixa de chat
-
----
-
-## Estrutura do Projeto
-
-```
-├── app.py                    # Interface Streamlit
-├── retriever.py              # Pipeline RAG (busca + geração)
-├── requirements.txt
-├── ingestion/
-│   ├── __init__.py
-│   ├── pdf_extractor.py      # Extração estrutural de PDFs
-│   ├── chunker.py            # Chunking hierárquico Parent-Child
-│   └── indexer.py            # Indexação e busca no ChromaDB
-└── chroma_db/                # Banco vetorial (gerado em runtime)
-```
-
----
-
-## Pipeline de Ingestão — Detalhes Técnicos
-
-### 1. Extração (`pdf_extractor.py`)
-
-O extrator usa `get_text("dict")` do PyMuPDF para obter cada span com seus atributos tipográficos (tamanho de fonte, negrito, posição). A partir disso:
-
-- Reconstrói a hierarquia do documento (Seção > Cláusula > Parágrafo) sem depender de tags HTML
-- Detecta o tamanho de fonte do corpo por frequência ponderada (funciona para qualquer órgão emitente)
-- Classifica cada bloco semanticamente por contagem de padrões regex
-- Extrai metadados de entidades: datas, valores monetários, CNPJs, referências cruzadas entre cláusulas
-
-### 2. Chunking (`chunker.py`)
-
-- Agrupa blocos em seções lógicas (cada heading inicia uma nova seção)
-- Gera Parents de até 700 tokens com overlap de 100 tokens entre janelas
-- Subdivide cada Parent em Children de até 175 tokens com overlap de 30 tokens
-- Propaga todos os metadados da seção para parents e children
-
-### 3. Indexação (`indexer.py`)
-
-- Persiste children na coleção `editais_children` com embedding real (busca semântica)
-- Persiste parents na coleção `editais_parents` com embedding dummy (recuperação por ID)
-- Operação idempotente: IDs já existentes são ignorados (deduplicação por SHA-256)
-- Suporta múltiplos editais no mesmo banco via filtro por `edital_id`
-
-### 4. Recuperação (`retriever.py`)
-
-- Detecta a intenção da pergunta (prazo, documento, critério, objeto) para pré-filtrar a busca
-- Busca híbrida em duas camadas: filtrada por chunk_type + semântica pura, mescladas por parent_id
-- Expande cada child recuperado para seu parent (contexto completo)
-- Monta prompt com trechos numerados e cabeçalhos de localização (seção, cláusula, página)
-- Temperatura 0.0 no LLM para respostas determinísticas em documentos jurídicos
-
----
-
-## Decisões de Design
-
-**Por que duas coleções no ChromaDB?**  
-Separar children (busca) de parents (contexto) permite que a busca semântica opere em textos curtos e precisos, enquanto o LLM recebe o contexto completo da cláusula. Uma coleção única misturaria os dois e prejudicaria a qualidade da busca.
-
-**Por que nomic-embed-text em vez do modelo padrão do ChromaDB?**  
-O modelo padrão (all-MiniLM-L6-v2) é treinado principalmente em inglês. O nomic-embed-text é multilingual e produz distâncias coseno de 0.20–0.30 para textos relevantes em português, contra 0.40–0.62 do modelo padrão.
-
-**Por que temperatura 0.0 no LLM?**  
-Editais têm linguagem jurídica precisa. Um LLM com temperatura alta pode parafrasear prazos ou valores de forma incorreta. Temperatura zero garante que o modelo copia fielmente as informações do contexto.
-
-**Por que chunking por palavras e não por tokens exatos?**  
-A heurística `palavras × 1.35` aproxima bem o comportamento de tokenizadores para português (±5%) sem exigir dependência de tiktoken, que requer acesso à internet para download do vocabulário.
-
----
-
-## Limitações Conhecidas
-
-- PDFs escaneados (sem texto nativo) têm qualidade de extração reduzida. Recomenda-se pré-processar com OCR antes do upload.
-- O classificador de `chunk_type` usa regex e pode errar em editais com linguagem muito atípica. É possível retreinar os padrões editando `_PATTERNS` no `pdf_extractor.py`.
-- O tempo de indexação depende da velocidade do Ollama local.
+Com o Ollama em execução
+**streamlit run app.py**
