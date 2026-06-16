@@ -8,7 +8,7 @@ Sistema de perguntas e respostas sobre editais de licitação, concursos públic
 ## Equipe
 Gustavo Morais de Almada             
 Rafael Santos             
-Leonardo Melo Crespim          
+Gabriel Pepes Moda
 
 ---
 
