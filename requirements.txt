@@ -22,8 +22,8 @@ streamlit==1.56.0
 # LLM e orquestracao
 langchain-core==1.3.2
 langchain-ollama==1.1.0
- 
+langgraph==1.2.4
+
 # Embedding e utilitarios
 numpy==2.4.4
 requests==2.33.1
- 
