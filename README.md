@@ -125,3 +125,14 @@ ollama pull nomic-embed-text
 
 Com o Ollama em execução
 **streamlit run app.py**
+
+##Estrutura de arquivos
+├── app.py                    # Interface Streamlit customizada
+├── agent.py                  # Orquestração do Grafo LangGraph e Dataclasses RAG
+├── requirements.txt          # Dependências do ecossistema
+├── ingestion/
+│   ├── __init__.py
+│   ├── pdf_extractor.py      # Motor tipográfico e extrator de spans (PyMuPDF)
+│   ├── chunker.py            # Algoritmo de fatiamento hierárquico e janelas de overlap
+│   └── indexer.py            # Gerenciador idempotente de coleções (ChromaDB)
+└── chroma_db/                # Diretório de persistência do banco em runtime
